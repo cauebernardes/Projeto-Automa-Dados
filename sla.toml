@@ -1,0 +1,4 @@
+# Janela contínua de oito horas, de segunda a sexta, em America/Sao_Paulo.
+inicio = "09:00"
+# Datas ISO entre aspas. Lista vazia significa nenhum feriado configurado.
+feriados = []

@@ -1,401 +1,396 @@
 import os
-import re
+from html import escape
+import shutil
 import sqlite3
-import base64
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
+import administracao
+import empresas
+import chamados
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+from auth import audit_view, can_read_audit, login, migrate_passwords, prepare_sessions, valid_session
 from dotenv import load_dotenv
-import google.generativeai as genai
 
-# =========================
-# Config inicial
-# =========================
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-DB_PATH = os.getenv(
-    "DB_PATH", r"C:\Users\doido\OneDrive\Desktop\Automa_Dados_Demo_Streamlit\projeto.sqlite"
-)
+from ai_sql import MAX_ROWS, QueryBlocked, execute_ai_query
 
-st.set_page_config(page_title="Automa Dados - IA Auditável", layout="wide")
+from gemini_sql import GenerationError, generate
 
-# Tema escuro (preto + azul)
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #0B0F19; color: #E6EDF7; }
-    .stTextInput > div > div > input,
-    .stTextArea textarea {
-        background-color: #111827 !important;
-        color: #E6EDF7 !important;
-        border: 1px solid #1E3A8A !important;
-    }
-    .stButton > button {
-        background-color: #1D4ED8 !important;
-        color: #FFFFFF !important;
-        border: 1px solid #2563EB !important;
-    }
-    .stButton > button:hover {
-        background-color: #1E40AF !important;
-        border-color: #3B82F6 !important;
-    }
-
-    .stDownloadButton > button {
-        background-color: #1D4ED8 !important;
-        color: #FFFFFF !important;
-        border: 1px solid #2563EB !important;
-    }
-    .stDownloadButton > button:hover {
-        background-color: #1E40AF !important;
-        border-color: #3B82F6 !important;
-    }
-    .stAlert { background-color: #111827 !important; }
-    div[data-testid="stCodeBlock"] pre,
-    div[data-testid="stCode"] pre,
-    pre {
-        background-color: #111827 !important;
-        color: #E5E7EB !important;
-        border: 1px solid #374151 !important;
-        border-radius: 8px !important;
-    }
-    div[data-testid="stDataFrame"] {
-        background: #0B0F19 !important;
-        border: 1px solid #1F2937 !important;
-        border-radius: 8px !important;
-    }
-    div[data-testid="stDataFrame"] [data-testid="stTable"],
-    div[data-testid="stDataFrame"] [data-testid="stTableStyled"],
-    div[data-testid="stDataFrame"] [data-testid="stDataFrameResizable"],
-    div[data-testid="stDataFrame"] [data-testid="stDataFrameGlideDataEditor"],
-    div[data-testid="stDataFrame"] section,
-    div[data-testid="stDataFrame"] canvas {
-        background: #0B0F19 !important;
-    }
-    div[data-testid="stDataFrame"] * {
-        color: #E5E7EB !important;
-    }
-    div[data-testid="stDataFrame"] div[role="columnheader"],
-    div[data-testid="stDataFrame"] [class*="header"],
-    div[data-testid="stDataFrame"] [class*="Header"] {
-        background: #0B1220 !important;
-        color: #BFDBFE !important;
-        border-color: #1F2937 !important;
-    }
-    div[data-testid="stDataFrame"] div[role="gridcell"],
-    div[data-testid="stDataFrame"] [class*="cell"],
-    div[data-testid="stDataFrame"] [class*="Cell"] {
-        background: #111827 !important;
-        border-color: #1F2937 !important;
-    }
-    details[data-testid="stExpander"],
-    div[data-testid="stExpander"] {
-        background: #0F172A !important;
-        border: 1px solid #1F2937 !important;
-        border-radius: 8px !important;
-    }
-    details[data-testid="stExpander"] summary,
-    div[data-testid="stExpander"] summary,
-    div[data-testid="stExpander"] > div:first-child {
-        background: #0B1220 !important;
-        color: #BFDBFE !important;
-        border-radius: 8px !important;
-    }
-    details[data-testid="stExpander"] > div,
-    div[data-testid="stExpander"] > div {
-        background: #0F172A !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 BASE_DIR = Path(__file__).parent
-DASH_PDF = BASE_DIR / "dashboard automa.pdf"
-DASH_PNG = BASE_DIR / "dashboard_automa.png"
-LOGO_PNG = BASE_DIR / "logo_automata.png"
+DATA_DIR = BASE_DIR / "dados_empresas"
+SOURCE_DB = BASE_DIR / "projeto.sqlite"
+load_dotenv(BASE_DIR / ".env", override=False)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+EMPRESAS = {
+    "varejmais": {
+        "nome": "VarejMais",
+        "ramo": "Varejo e distribuição",
+        "db": DATA_DIR / "varejmais.sqlite",
+        "descricao": "Ambiente comercial: vendas, produtos, clientes e logística.",
+    },
+    "servifacil": {
+        "nome": "ServiFácil",
+        "ramo": "Serviços e suporte técnico",
+        "db": DATA_DIR / "servifacil.sqlite",
+        "descricao": "Ambiente de serviços: chamados, SLA e contratos.",
+    },
+}
+
+st.set_page_config(page_title="Automa Dados", page_icon="📊", layout="wide")
+st.html("""<style>
+:root {--ink:#122d35;--muted:#52666d;--line:#d9e3e3;--teal:#116c68}
+.stApp {background:#f4f7f6;color:var(--ink)}
+[data-testid="stMainBlockContainer"] {max-width:1440px;padding:3.6rem clamp(1rem,3vw,3.4rem) 3rem}
+[data-testid="stHeader"] {background:transparent}
+[data-testid="stSidebar"] {border-right:1px solid var(--line);background:#eaf0ef}
+[data-testid="stSidebarUserContent"] {padding-top:1rem}
+.ad-brand {display:flex;align-items:center;gap:.75rem;font:700 1.23rem/1.2 "Inter","Segoe UI",sans-serif;letter-spacing:-.045em;margin:0 0 2.4rem}
+.ad-mark {display:inline-flex;align-items:end;gap:3px;background:#0c494b;border-radius:10px;padding:10px;width:37px;height:37px;box-sizing:border-box}
+.ad-mark i {flex:1;background:#a7e4c8;height:58%;border-radius:2px}.ad-mark i:nth-child(2){height:100%}.ad-mark i:last-child{height:77%}
+[data-testid="stSidebar"] [role="radiogroup"] label {background:#f9fbfa;border:1px solid var(--line);border-radius:10px;padding:.55rem .65rem}
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked){background:#daf1e9;border-color:#81bbaa}
+.ad-hero {isolation:isolate;position:relative;overflow:hidden;background:linear-gradient(115deg,#102f39,#115851);color:#fff;border-radius:20px;padding:clamp(1.5rem,3.4vw,3.4rem);margin-bottom:.5rem}
+.ad-hero:after {content:"";position:absolute;z-index:-1;right:-108px;bottom:-222px;width:470px;height:470px;border-radius:32%;transform:rotate(-35deg);border:1px solid #a7e7ca69;box-shadow:0 0 0 23px #225c59,0 0 0 24px #91c9af4a,0 0 0 47px #1b5754,0 0 0 48px #91c9af40,0 0 0 72px #18544f,0 0 0 73px #91c9af30}
+.ad-hero h1 {color:white;font:650 clamp(2.05rem,4vw,4.2rem)/1.05 "Inter","Segoe UI",sans-serif;letter-spacing:-.055em;margin:0;padding:.65rem 0 .8rem;overflow-wrap:anywhere}
+.ad-hero p {color:#d9ebe7;font-size:1rem;margin:0;max-width:33rem}
+.ad-kicker {font-size:.74rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#a8e2cc}
+.ad-access {min-height:335px;display:flex;flex-direction:column;justify-content:center}
+.st-key-login_box {background:#fff;border:1px solid var(--line);padding:1.5rem;border-radius:18px}
+[data-testid="stTabs"] [role="tablist"] {gap:.3rem;background:#e7eeec;border-radius:12px;padding:.3rem;height:auto}
+[data-testid="stTabs"] [role="tab"] {height:2.55rem;padding:0 .9rem;border-radius:8px;color:#365056}
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] {background:white;color:#075852;box-shadow:0 1px 4px #152d351b}
+[data-baseweb="tab-highlight"],[data-baseweb="tab-border"] {display:none}
+[data-testid="stMetric"] {border:1px solid var(--line);border-radius:14px;background:white;padding:1rem 1.1rem;border-top:3px solid #62a995;min-height:102px}
+[data-testid="stMetricValue"] {font-size:clamp(1.15rem,1.72vw,2.2rem);font-weight:650;letter-spacing:-.05em;font-variant-numeric:tabular-nums}
+[data-testid="stMetricValue"] > div {white-space:normal;overflow-wrap:anywhere}
+h2,h3 {color:var(--ink);letter-spacing:-.035em}
+[data-testid="stExpander"],[data-testid="stForm"] {background:#fff;border-radius:14px}
+.st-key-chart_card {background:#fff;border:1px solid var(--line);border-radius:16px;padding:1rem 1.3rem}
+[data-testid="stSidebar"] hr {border-color:#cdd9d6}
+@media(max-width:760px){.ad-access{min-height:180px}.ad-hero:after{opacity:.65}.ad-hero{padding:1.4rem}[data-testid="stMetric"]{min-height:82px}}
+</style>""")
 
 
-def render_brand_header():
-    c_logo, c_title = st.columns([1, 4], gap="small")
-    with c_logo:
-        if LOGO_PNG.exists():
-            st.image(str(LOGO_PNG), width=120)
-    with c_title:
-        st.title("Automa Dados — IA Auditável (MVP)")
+def get_conn(db_path: Path):
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-render_brand_header()
-
-if not GEMINI_API_KEY:
-    st.error("GEMINI_API_KEY não encontrada no .env")
-    st.stop()
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
-
-
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-
-conn = get_conn()
-cur = conn.cursor()
-
-cur.execute(
-    """
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT,
-    role TEXT,
-    pergunta TEXT,
-    sql_gerado TEXT,
-    tabelas_alvo TEXT,
-    status TEXT,
-    motivo TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-)
-"""
-)
-conn.commit()
-
-# migração leve para quem já tinha tabela antiga
-for col, ddl in [
-    ("role", "ALTER TABLE audit_log ADD COLUMN role TEXT"),
-    ("tabelas_alvo", "ALTER TABLE audit_log ADD COLUMN tabelas_alvo TEXT"),
-]:
-    try:
-        conn.execute(ddl)
-        conn.commit()
-    except Exception:
-        pass
+def ensure_common_tables(conn, empresa):
+    conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, empresa TEXT NOT NULL, username TEXT,
+        role TEXT, acao TEXT, pergunta TEXT, sql_gerado TEXT, tabelas_alvo TEXT,
+        status TEXT, motivo TEXT, created_at TEXT DEFAULT (datetime('now'))
+    )""")
+    # Migração segura do banco legado da VarejMais.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(audit_log)")}
+    for col, ddl in [("empresa", "TEXT"), ("role", "TEXT"), ("acao", "TEXT"), ("tabelas_alvo", "TEXT")]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE audit_log ADD COLUMN {col} {ddl}")
+    # Registros legados sem empresa permanecem intactos no banco isolado.
+    conn.commit()
+    migrate_passwords(conn)
+    prepare_sessions(conn)
+    if empresa == "ServiFácil":
+        chamados.migrate(conn, chamados.calendar())
 
 
-def login(username, senha):
-    q = """
-    SELECT username, nome, role
-    FROM usuarios
-    WHERE username = ? AND senha = ? AND ativo = 1
-    LIMIT 1
-    """
-    row = conn.execute(q, (username, senha)).fetchone()
-    return row
+def bootstrap_servifacil(path: Path):
+    conn = get_conn(path)
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS usuarios (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+      nome TEXT NOT NULL, senha_hash TEXT NOT NULL, role TEXT NOT NULL,
+      ativo INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS chamados (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, titulo TEXT NOT NULL, descricao TEXT,
+      solicitante TEXT NOT NULL, prioridade TEXT NOT NULL, status TEXT NOT NULL,
+      responsavel TEXT, aberto_em TEXT NOT NULL, prazo_sla TEXT NOT NULL,
+      concluido_em TEXT
+    );
+    CREATE TABLE IF NOT EXISTS contratos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, cliente TEXT NOT NULL, plano TEXT NOT NULL,
+      valor_mensal REAL NOT NULL, status TEXT NOT NULL
+    );
+    """)
+    if not conn.execute("SELECT 1 FROM usuarios LIMIT 1").fetchone():
+        conn.executemany("INSERT INTO usuarios(username,nome,senha_hash,role) VALUES (?,?,?,?)", [
+            ('admin.servi', 'Marina Costa', '$argon2id$v=19$m=65536,t=3,p=4$kKB1BNvgyQZ+YCP8XYaDWQ$m1cFXStanVLlKPCAuBBfJ1hkMJ3vCKPu8GutZPHRBqs', 'admin'),
+            ('suporte.servi', 'Lucas Almeida', '$argon2id$v=19$m=65536,t=3,p=4$k3Qa+Zay8KQ83Yd7eDVMyw$q3RaYCu0JlGmg6EQxvIqeAnQeLKyGdTs/iYZMb24L8U', 'viewer'),
+        ])
+        now = chamados.local()
+        exemplos = [
+            ("VPN indisponível", "Unidade central sem acesso remoto", "Ana Martins", "Urgente", "Em atendimento", "Lucas Almeida", now - timedelta(hours=2), now + timedelta(hours=6), None),
+            ("Acesso ao portal", "Novo colaborador sem credencial", "Bruno Lima", "Alta", "Aberto", None, now - timedelta(hours=8), now + timedelta(hours=16), None),
+            ("Atualizar cadastro", "Alterar telefone do cliente", "Carla Souza", "Média", "Concluído", "Lucas Almeida", now - timedelta(days=2), now - timedelta(hours=3), now - timedelta(hours=5)),
+        ]
+        conn.executemany("""INSERT INTO chamados(titulo,descricao,solicitante,prioridade,status,responsavel,aberto_em,prazo_sla,concluido_em)
+                          VALUES (?,?,?,?,?,?,?,?,?)""", [(a,b,c,d,e,f,g.strftime("%Y-%m-%d %H:%M:%S"),h.strftime("%Y-%m-%d %H:%M:%S"),i.strftime("%Y-%m-%d %H:%M:%S") if i else None) for a,b,c,d,e,f,g,h,i in exemplos])
+        conn.executemany("INSERT INTO contratos(cliente,plano,valor_mensal,status) VALUES (?,?,?,?)", [
+            ("Oficina Horizonte", "Profissional", 1890, "Ativo"), ("Clínica Vida", "Essencial", 990, "Ativo"), ("Studio Alfa", "Profissional", 1890, "Ativo"),
+        ])
+    conn.commit()
+    ensure_common_tables(conn, "ServiFácil")
+    conn.close()
 
 
+def bootstrap_databases():
+    DATA_DIR.mkdir(exist_ok=True)
+    varejo = EMPRESAS["varejmais"]["db"]
+    if not varejo.exists():
+        if not SOURCE_DB.exists():
+            raise FileNotFoundError("Banco legado projeto.sqlite não encontrado.")
+        shutil.copy2(SOURCE_DB, varejo)
+    conn = get_conn(varejo)
+    ensure_common_tables(conn, "VarejMais")
+    conn.close()
+    if not EMPRESAS["servifacil"]["db"].exists():
+        bootstrap_servifacil(EMPRESAS["servifacil"]["db"])
+    else:
+        conn = get_conn(EMPRESAS["servifacil"]["db"])
+        ensure_common_tables(conn, "ServiFácil")
+        conn.close()
+
+
+bootstrap_databases()
+EMPRESAS.update(empresas.discover(DATA_DIR))
+
+if "empresa_id" not in st.session_state:
+    st.session_state.empresa_id = "varejmais"
 if "user" not in st.session_state:
     st.session_state.user = None
 
-if st.session_state.user is None:
-    st.subheader("Login")
-    u = st.text_input("Usuário")
-    s = st.text_input("Senha", type="password")
-    if st.button("Entrar"):
-        row = login(u, s)
-        if row:
-            st.session_state.user = {"username": row[0], "nome": row[1], "role": row[2]}
-            st.success(f"Bem-vindo, {row[1]} ({row[2]})")
-            st.rerun()
-        else:
-            st.error("Usuário/senha inválidos.")
-    st.stop()
 
-user = st.session_state.user
-audit_actor = (user.get("nome") or user.get("username") or "usuario_desconhecido").strip()
-st.caption(f"Logado como: **{user['nome']}** | perfil: **{user['role']}**")
-
-if st.button("Sair"):
-    st.session_state.user = None
-    st.rerun()
-
-FORBIDDEN = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "ATTACH", "DETACH", "PRAGMA"]
+def empresa_atual():
+    return EMPRESAS[st.session_state.empresa_id]
 
 
-def is_sql_safe(sql: str):
-    if not sql:
-        return False, "SQL vazio"
-    clean = sql.strip().upper()
-    if not clean.startswith("SELECT"):
-        return False, "Apenas SELECT é permitido"
-    for word in FORBIDDEN:
-        if re.search(rf"\b{word}\b", clean):
-            return False, f"Comando proibido detectado: {word}"
-    if ";" in clean[:-1]:
-        return False, "Múltiplas instruções não permitidas"
-    return True, "OK"
-
-
-def extract_target_tables(sql: str):
-    found = re.findall(r"\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql, flags=re.IGNORECASE)
-    return sorted(set([t.lower() for t in found]))
-
-
-# Whitelist explícita por perfil (RBAC)
-VIEWER_ALLOWED_TABLES = {
-    "dim_tempo",
-    "dim_produto",
-    "dim_cliente",
-    "dim_fornecedor",
-    "fato_vendas",
-    "fato_compras",
-    "fato_logistica",
-}
-
-def can_role_access_tables(role: str, tables: list[str]):
-    role = (role or "").lower().strip()
-    if role == "admin":
-        return True, "OK"
-
-    if role == "viewer":
-        for t in tables:
-            if t not in VIEWER_ALLOWED_TABLES:
-                return False, f"Perfil viewer sem acesso à tabela: {t}"
-        return True, "OK"
-
-    return False, f"Perfil não reconhecido: {role}"
-
-
-def log_audit(username, role, pergunta, sql_gerado, tabelas_alvo, status, motivo):
-    conn.execute(
-        "INSERT INTO audit_log (username, role, pergunta, sql_gerado, tabelas_alvo, status, motivo) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (username, role, pergunta, sql_gerado, tabelas_alvo, status, motivo),
-    )
+def log_audit(conn, empresa, user, acao, pergunta="", sql="", tables="", status="ALLOWED", motivo="OK"):
+    conn.execute("""INSERT INTO audit_log(empresa,username,role,acao,pergunta,sql_gerado,tabelas_alvo,status,motivo)
+                    VALUES(?,?,?,?,?,?,?,?,?)""", (empresa, user.get("username", "sistema"), user.get("role", ""), acao, pergunta, sql, tables, status, motivo))
     conn.commit()
 
 
-def get_schema_text():
-    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-    schema_lines = []
-    allowed_tables = [t for t in tables if t.startswith("dim_") or t.startswith("fato_")]
-    for t in allowed_tables:
-        cols = conn.execute(f"PRAGMA table_info({t})").fetchall()
-        col_names = ", ".join([c[1] for c in cols])
-        schema_lines.append(f"{t}({col_names})")
-    return "\n".join(schema_lines), allowed_tables
+def header(emp, access=False):
+    mode = " ad-access" if access else ""
+    title = escape(emp["nome"])
+    subtitle = escape(emp["ramo"])
+    label = "Acesso ao ambiente" if access else "Painel da empresa"
+    st.html(f'<section class="ad-hero{mode}"><span class="ad-kicker">{label}</span>'
+            f'<h1>{title}</h1><p>{subtitle}</p></section>')
 
 
-def _fmt_num_br(x):
-    try:
-        return f"{float(x):,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
-    except Exception:
-        return x
+with st.sidebar:
+    st.html('<div class="ad-brand"><span class="ad-mark" aria-hidden="true"><i></i><i></i><i></i></span>Automa Dados</div>')
+    labels = {k: v["nome"] if k in empresas.BUILTINS else f"{v['nome']} ({k})" for k, v in EMPRESAS.items()}
+    chosen = st.radio("Selecione o cliente", list(labels), format_func=lambda x: labels[x], index=list(labels).index(st.session_state.empresa_id))
+    if chosen != st.session_state.empresa_id:
+        st.session_state.empresa_id = chosen
+        st.session_state.user = None
+        st.rerun()
+    st.divider()
+    st.caption(empresa_atual()["descricao"])
 
+emp = empresa_atual()
+conn = get_conn(emp["db"])
 
-def style_df(df: pd.DataFrame):
-    styler = df.style.set_properties(**{"background-color": "#111827", "color": "#E5E7EB"})
-    try:
-        styler = styler.hide(axis="index")
-    except Exception:
-        pass
-    return styler
+if st.session_state.user and not valid_session(conn, st.session_state.empresa_id, st.session_state.user):
+    st.session_state.user = None
 
+if st.session_state.user is None:
+    intro, form = st.columns([1.2, 1], gap="large", vertical_alignment="center")
+    with intro:
+        header(emp, access=True)
+    with form.container(key="login_box"):
+        st.subheader("Entrar")
+        st.caption("Use sua conta da empresa selecionada.")
+        username = st.text_input("Usuário")
+        senha = st.text_input("Senha", type="password")
+        if st.button("Entrar", type="primary", use_container_width=True):
+            row = login(conn, st.session_state.empresa_id, username, senha)
+            if row:
+                st.session_state.user = dict(row)
+                log_audit(conn, emp["nome"], st.session_state.user, "LOGIN")
+                st.rerun()
+            else:
+                st.error("Usuário ou senha inválidos para esta empresa.")
+    st.stop()
 
-def render_dark_table(df: pd.DataFrame):
-    df_view = df.copy()
-    for col in df_view.select_dtypes(include="number").columns:
-        df_view[col] = df_view[col].map(_fmt_num_br)
-    st.markdown("<div style='background:#0B0F19;padding:4px;border:1px solid #1F2937;border-radius:8px;overflow:auto;'>" + style_df(df_view).to_html() + "</div>", unsafe_allow_html=True)
+user = st.session_state.user
+header(emp)
+with st.sidebar:
+    st.divider()
+    st.text(user["nome"])
+    st.caption("Administrador" if user["role"] == "admin" else "Leitor")
+    if st.button("Sair"):
+        log_audit(conn, emp["nome"], user, "LOGOUT")
+        st.session_state.user = None
+        st.rerun()
 
+company = st.session_state.empresa_id
+show_audit = can_read_audit(conn, company, user)
+service = company == "servifacil"
+tabs = st.tabs(["Painel", "Consulta com IA"] + (["Chamados & SLA"] if service else []) + (["Auditoria", "Usuários"] if show_audit else []))
 
-schema_text, allowed_tables = get_schema_text()
-
-SYSTEM_PROMPT = f"""
-Você é um gerador de SQL para SQLite.
-REGRAS OBRIGATÓRIAS:
-- Gere SOMENTE uma query SQL válida.
-- A query deve começar com SELECT.
-- Nunca gere INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, PRAGMA.
-- Use apenas tabelas permitidas abaixo:
-{", ".join(allowed_tables)}
-
-Esquema disponível:
-{schema_text}
-
-Responda APENAS com SQL puro, sem markdown e sem explicações.
-"""
-
-col_main, col_dash = st.columns([1.9, 1.1], gap="large")
-
-with col_main:
-    st.subheader("Consulta com IA (Gemini)")
-    pergunta = st.text_area("Pergunte sobre os dados (ex.: faturamento por mês, top produtos...)")
-
-    if st.button("Consultar"):
-        if not pergunta.strip():
-            st.warning("Digite uma pergunta.")
-        else:
-            try:
-                prompt = f"{SYSTEM_PROMPT}\nPergunta do usuário: {pergunta}"
-                resp = model.generate_content(prompt)
-                sql = resp.text.strip().replace("```sql", "").replace("```", "").strip()
-
-                st.markdown("**SQL gerado:**")
-                st.code(sql, language="sql")
-
-                safe, motivo = is_sql_safe(sql)
-                tables = extract_target_tables(sql)
-                tables_txt = ", ".join(tables) if tables else "(nenhuma identificada)"
-
-                if safe:
-                    role_ok, role_motivo = can_role_access_tables(user.get("role", ""), tables)
-                    if not role_ok:
-                        safe, motivo = False, role_motivo
-
-                if not safe:
-                    log_audit(audit_actor, user.get("role", ""), pergunta, sql, tables_txt, "BLOCKED", motivo)
-                    st.error(f"Bloqueado: {motivo}")
-                else:
-                    df = pd.read_sql_query(sql, conn)
-                    log_audit(audit_actor, user.get("role", ""), pergunta, sql, tables_txt, "ALLOWED", "OK")
-                    st.success("Consulta executada com sucesso.")
-                    st.session_state["last_df"] = df
-                    render_dark_table(df)
-
-            except Exception as e:
-                log_audit(audit_actor, user.get("role", ""), pergunta, "", "", "ERROR", str(e))
-                st.error(f"Erro: {e}")
-
-    with st.expander("Ver últimos logs de auditoria"):
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            status_f = st.selectbox("Status", ["TODOS","ALLOWED","BLOCKED","ERROR"], index=0)
-        with c2:
-            dias = st.selectbox("Período", [1,3,7,30,9999], index=2)
-        with c3:
-            limite = st.selectbox("Limite", [30,50,100,300], index=1)
-
-        where = []
-        params = []
-        if status_f != "TODOS":
-            where.append("status = ?")
-            params.append(status_f)
-        if dias != 9999:
-            dt = (datetime.now() - timedelta(days=int(dias))).strftime("%Y-%m-%d %H:%M:%S")
-            where.append("created_at >= ?")
-            params.append(dt)
-
-        sql_logs = "SELECT id, username, role, pergunta, sql_gerado, tabelas_alvo, status, motivo, created_at FROM audit_log"
-        if where:
-            sql_logs += " WHERE " + " AND ".join(where)
-        sql_logs += f" ORDER BY id DESC LIMIT {int(limite)}"
-
-        logs = pd.read_sql_query(sql_logs, conn, params=params)
-        render_dark_table(logs)
-        st.download_button("Exportar logs CSV", data=logs.to_csv(index=False).encode("utf-8-sig"), file_name="audit_log_filtrado.csv", mime="text/csv", use_container_width=True)
-
-    if "last_df" in st.session_state and isinstance(st.session_state["last_df"], pd.DataFrame):
-        st.download_button("Exportar resultado da consulta CSV", data=st.session_state["last_df"].to_csv(index=False).encode("utf-8-sig"), file_name="resultado_consulta.csv", mime="text/csv", use_container_width=True)
-
-with col_dash:
-    st.subheader("Dashboard Gerencial")
-    st.caption("Power BI — Faturamento, evolução temporal e top produtos")
-
-    if DASH_PNG.exists():
-        st.image(str(DASH_PNG), use_container_width=True)
-    elif DASH_PDF.exists():
-        pdf_bytes = DASH_PDF.read_bytes()
-        b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-        st.markdown(f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="620" type="application/pdf"></iframe>', unsafe_allow_html=True)
-        st.download_button("Baixar dashboard (PDF)", data=pdf_bytes, file_name="dashboard_automa.pdf", mime="application/pdf", use_container_width=True)
+with tabs[0]:
+    if not service:
+        vendas = conn.execute("SELECT COUNT(*), COALESCE(SUM(valor_total),0), COALESCE(AVG(valor_total),0) FROM fato_vendas").fetchone()
+        clientes = conn.execute("SELECT COUNT(*) FROM dim_cliente").fetchone()[0]
+        a,b,c,d = st.columns(4)
+        a.metric("Vendas registradas", f"{vendas[0]:,}".replace(",", "."))
+        b.metric("Faturamento", f"R$ {vendas[1]:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        c.metric("Ticket médio", f"R$ {vendas[2]:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        d.metric("Clientes", clientes)
+        with st.container(key="chart_card"):
+            st.subheader("Top produtos por faturamento")
+            sql = """SELECT p.nome_produto AS Produto, ROUND(SUM(v.valor_total),2) AS Faturamento
+                     FROM fato_vendas v JOIN dim_produto p ON p.id_produto=v.id_produto
+                     GROUP BY p.nome_produto ORDER BY Faturamento DESC LIMIT 8"""
+            st.bar_chart(pd.read_sql_query(sql, conn), x="Produto", y="Faturamento", horizontal=True, sort="-Faturamento", color="#178276", height=320)
     else:
-        st.info("Arquivo da dashboard não encontrado na pasta do projeto.")
+        total, abertos, vencidos = chamados.counts(conn)
+        mrr = conn.execute("SELECT COALESCE(SUM(valor_mensal),0) FROM contratos WHERE status='Ativo'").fetchone()[0]
+        a,b,c,d = st.columns(4)
+        a.metric("Chamados", total); b.metric("Em aberto", abertos); c.metric("SLA vencido", vencidos); d.metric("Receita mensal", f"R$ {mrr:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        with st.container(key="chart_card"):
+            st.subheader("Chamados por prioridade")
+            chart = pd.read_sql_query("SELECT prioridade, COUNT(*) AS quantidade FROM chamados GROUP BY prioridade", conn)
+            st.bar_chart(chart, x="prioridade", y="quantidade", x_label="Prioridade", y_label="Chamados", color="#178276", height=280)
+
+with tabs[1]:
+    st.subheader("Consulta em linguagem natural")
+    if not GEMINI_API_KEY:
+        st.warning("Gemini não configurado neste ambiente. Painel, chamados e auditoria seguem funcionais.")
+    else:
+        question = st.text_area("Pergunte sobre os dados da empresa")
+        if st.button("Gerar consulta"):
+            company = st.session_state.empresa_id
+            try:
+                sql = generate(question, company, user["role"], EMPRESAS, GEMINI_API_KEY)
+            except (QueryBlocked, GenerationError) as exc:
+                status = "BLOCKED" if isinstance(exc, QueryBlocked) else "ERROR"
+                log_audit(conn, emp["nome"], user, "CONSULTA_IA", question, status=status, motivo=str(exc))
+                st.error(str(exc))
+            except Exception:
+                log_audit(conn, emp["nome"], user, "CONSULTA_IA", question, status="ERROR", motivo="Falha na integração Gemini.")
+                st.error("Falha na integração Gemini.")
+            else:
+                st.code(sql, language="sql")
+                try:
+                    result, truncated = execute_ai_query(conn, company, emp["nome"], user, question, sql)
+                except QueryBlocked as exc:
+                    st.error(str(exc))
+                except sqlite3.Error:
+                    st.error("Falha ao executar ou registrar a consulta.")
+                else:
+                    if truncated:
+                        st.info(f"Resultado limitado a {MAX_ROWS} registros.")
+                    st.dataframe(result, use_container_width=True)
+                    st.download_button("Exportar CSV", result.to_csv(index=False).encode("utf-8-sig"), "resultado_consulta.csv", "text/csv")
+
+
+if service:
+    with tabs[2]:
+        st.subheader("Central de chamados")
+        try:
+            calls = chamados.tickets(conn, user)
+            if user["role"] == "admin":
+                with st.expander("Abrir novo chamado"):
+                    with st.form("novo_chamado", clear_on_submit=True):
+                        title = st.text_input("Título")
+                        description = st.text_area("Descrição")
+                        requester = st.text_input("Solicitante", value=user["nome"])
+                        category = st.text_input("Categoria", value="Geral")
+                        priority = st.selectbox("Prioridade", list(chamados.HOURS), index=2)
+                        submit = st.form_submit_button("Registrar chamado")
+                    if submit:
+                        chamados.create(conn, user, title, description, requester, category, priority, chamados.calendar())
+                        st.rerun()
+            st.dataframe(calls.drop(columns="versao", errors="ignore"), hide_index=True, use_container_width=True)
+            if not calls.empty:
+                selected = st.selectbox("Chamado", calls["id"].tolist())
+                row = calls.loc[calls["id"] == selected].iloc[0]
+                if user["role"] == "admin" and row.status != "Fechado":
+                    if pd.isna(row.primeira_resposta_em):
+                        with st.expander("Registrar primeira resposta"):
+                            with st.form(f"responder_{selected}_{row.versao}"):
+                                message = st.text_area("Resposta comunicada ao solicitante")
+                                if st.form_submit_button("Registrar resposta"):
+                                    chamados.first_response(conn, user, selected, int(row.versao), message)
+                                    st.rerun()
+                    with st.expander("Atualizar chamado"):
+                        with st.form(f"editar_{selected}_{row.versao}"):
+                            state = st.selectbox("Status", chamados.STATES, index=chamados.STATES.index(row.status))
+                            owner = st.text_input("Responsável", value=row.responsavel or "")
+                            priority = st.selectbox("Prioridade", list(chamados.HOURS), index=list(chamados.HOURS).index(row.prioridade))
+                            category = st.text_input("Categoria", value=row.categoria)
+                            save = st.form_submit_button("Salvar atualização")
+                        if save:
+                            chamados.update(conn, user, selected, int(row.versao), state, owner, priority, category, chamados.calendar())
+                            st.rerun()
+                with st.expander("Histórico do chamado"):
+                    st.dataframe(chamados.history(conn, user, selected), hide_index=True, use_container_width=True)
+        except (PermissionError, ValueError) as exc:
+            st.error(str(exc))
+
+
+if show_audit:
+    with tabs[-2]:
+        st.subheader("Auditoria do ambiente atual")
+        left, right = st.columns(2)
+        account_filter = left.text_input("Filtrar por login", key=f"audit_user_{company}").strip() or None
+        result_filter = right.selectbox("Status do evento", [None, "ALLOWED", "BLOCKED", "ERROR"],
+            format_func=lambda item: item or "Todos", key=f"audit_status_{company}")
+        report, payload = audit_view(conn, company, user, account_filter, result_filter)
+        st.caption("Consultas de IA entre os últimos 200 eventos que correspondem aos filtros")
+        queries = report.loc[report.acao == "CONSULTA_IA", "status"]
+        for column, status, label in zip(st.columns(3), ["ALLOWED", "BLOCKED", "ERROR"],
+                ["Permitidas", "Bloqueadas", "Com erro"]):
+            column.metric(label, int((queries == status).sum()))
+        st.dataframe(report, use_container_width=True, hide_index=True)
+        if not report.empty:
+            with st.expander("Detalhes do evento"):
+                event_id = st.selectbox("Evento", report.id.tolist(), key=f"auditoria_evento_{company}")
+                event = report.loc[report.id == event_id].iloc[0]
+                st.text(f"{event.status} · {event.username} · {event.created_at}")
+                if event.pergunta:
+                    st.write(event.pergunta)
+                if event.motivo:
+                    st.text(event.motivo)
+                if event.sql_gerado:
+                    st.code(event.sql_gerado, language="sql")
+        # O arquivo segue na sessão autorizada, sem URL de mídia compartilhável.
+        components.html(f'<a download="auditoria_{company}.csv" href="data:text/csv;base64,{payload}">Exportar auditoria CSV</a>', height=40)
+
+    with tabs[-1]:
+        st.subheader("Usuários da empresa")
+        try:
+            users = administracao.accounts(conn, company, user)
+            st.dataframe(users, hide_index=True, use_container_width=True)
+            with st.form("cadastrar_usuario", clear_on_submit=True):
+                account = st.text_input("Novo usuário")
+                fullname = st.text_input("Nome completo")
+                role = st.selectbox("Perfil", ["viewer", "admin"])
+                password = st.text_input("Senha inicial (mínimo 12 caracteres)", type="password")
+                if st.form_submit_button("Cadastrar usuário"):
+                    administracao.create_user(conn, company, user, account, fullname, role, password)
+                    st.rerun()
+            account = st.selectbox("Conta para administrar", users.username.tolist())
+            active = bool(users.loc[users.username == account, "ativo"].iloc[0])
+            if st.button("Desativar conta" if active else "Ativar conta"):
+                action = "DESATIVACAO_USUARIO" if active else "ATIVACAO_USUARIO"
+                administracao.change_user(conn, company, user, account, action)
+                st.rerun()
+            with st.form("redefinir_senha", clear_on_submit=True):
+                new_password = st.text_input("Nova senha (mínimo 12 caracteres)", type="password")
+                if st.form_submit_button("Redefinir senha"):
+                    administracao.change_user(conn, company, user, account, "REDEFINICAO_SENHA", new_password)
+                    st.rerun()
+        except (ValueError, PermissionError) as exc:
+            st.error(str(exc))

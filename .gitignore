@@ -1,3 +1,28 @@
-﻿.env
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and generated caches
+.venv/
+.venv_*/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local runtime artifacts and restoration copies
+restauracao/
+*.log
+
+# Generated delivery packages (the source and final documentation are versioned)
+*.zip
+
+# Local QA tooling and duplicated test environments
+.qa_conformidade/tools/
+.qa_conformidade/ambiente*/
