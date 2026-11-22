@@ -1,3 +1,50 @@
-﻿.env
+# Credenciais e configuração local
+.env
+.env.*
+*.env
+.envrc
+secrets.toml
+secrets/
+credentials*.json
+*service-account*.json
+*service_account*.json
+*api_key*
+*.pem
+*.key
+*.p12
+*.pfx
+# Bancos e dados locais
+dados_empresas/
+*.sqlite*
+*.db
+*.db-*
+*.csv
+# Python e ferramentas
+.venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+# Cópias, evidências e temporários
+restauracao/
+backup*/
+backups/
+*.backup
+*.bak
+*.zip
+*.bundle
+*.git/
+preparacao_github/
+.qa*/
+tmp*/
+temp/
+*.tmp
+*.log
+~$*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
